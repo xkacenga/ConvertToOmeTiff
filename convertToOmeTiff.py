@@ -1,106 +1,84 @@
-#!/usr/bin/python3
-
+#!/usr/bin/env python3
+  
+import sys
 import pyvips
-import configparser
 import xml.etree.ElementTree as ET
-import argparse
 
 def main():
-    args = parseArguments()
-    if args.compression != "jpeg" and args.compression != "jp2k":
-        print("Wrong compression type! Compression has to be 'jpeg' or 'jp2k'")
-        return
-    convertSlide(args.input, args.output, args.compression, args.quality)
+    im = pyvips.Image.new_from_file(sys.argv[1])
 
-
-def parseArguments():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("input", help="INPUT slide (directory) path")
-    parser.add_argument("output", help="OUTPUT slide (directory) path")
-    parser.add_argument("--quality", default=80, type=int,
-                        help="compression quality [1-100] (default = 80)")
-    parser.add_argument("--compression",  type=str,
-                        help="compression ('jpeg' or 'jp2k')")
-    return parser.parse_args()
-
-def convertSlide(inputPath, outputPath, compression, quality):
-    im = pyvips.Image.openslideload(inputPath)
-    im = removeAlpha(im)
-    omeXml = createOmeXml(inputPath, im)
-    im = setImageMetadata(im, omeXml)
-    
-    im.tiffsave(outputPath, compression=compression, tile=True,
-                tile_width=256, tile_height=256,
-                pyramid=True, Q=quality, subifd=True) 
-
-def createOmeXml(inputPath, im):
-    xmlRoot = getMinimalOmeXmlRoot(im)
-    metadataDict = extractMetadata(inputPath)
-    omeXml = mergeXmlAndMetadata(xmlRoot, metadataDict)
-    return omeXml
-
-def setImageMetadata(im, omeXml):
-    im = im.copy()
-    im.set_type(pyvips.GValue.gint_type, "page-height", im.height)
-    im.set_type(pyvips.GValue.gstr_type, "image-description", omeXml)
-    return im
-
-def removeAlpha(im):
+    # openslide will add an alpha ... drop it
     if im.hasalpha():
         im = im[:-1]
-    return im
 
-def getMinimalOmeXmlRoot(im):
-    xmlStr = f"""<?xml version="1.0" encoding="UTF-8"?>
-    <!-- Warning: this comment is an OME-XML metadata block, which contains
-    crucial dimensional parameters and other important metadata. Please edit
-    cautiously (if at all), and back up the original data before doing so.
-    For more information, see the OME-TIFF documentation:
-    https://docs.openmicroscopy.org/latest/ome-model/ome-tiff/ -->
+    image_height = im.height
+    image_bands = im.bands
+
+    # split to separate image planes and stack vertically ready for OME 
+    im = pyvips.Image.arrayjoin(im.bandsplit(), across=1)
+
+    # set minimal OME metadata
+    # before we can modify an image (set metadata in this case), we must take a 
+    # private copy
+    im = im.copy()
+    im.set_type(pyvips.GValue.gint_type, "page-height", image_height)
+    
+    initialXml = f"""<?xml version="1.0" encoding="UTF-8"?>
     <OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06"
         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
         xsi:schemaLocation="http://www.openmicroscopy.org/Schemas/OME/2016-06 http://www.openmicroscopy.org/Schemas/OME/2016-06/ome.xsd">
         <Image ID="Image:0">
             <Pixels DimensionOrder="XYCZT"
                     ID="Pixels:0"
-                    SizeC="{im.bands}"
+                    SizeC="{image_bands}"
                     SizeT="1"
                     SizeX="{im.width}"
-                    SizeY="{im.height}"
+                    SizeY="{image_height}"
                     SizeZ="1"
                     Type="uint8">
+                        <MetadataOnly/>
             </Pixels>
         </Image>
     </OME>"""
-    return ET.fromstring(xmlStr)
-    
-def extractMetadata(inputPath):
-    slidedatPath = inputPath.rsplit('.', 1)[0] + '/Slidedat.ini'
-    config = configparser.ConfigParser()
-    config.read(slidedatPath, encoding='utf-8-sig')
-    return dict(config['GENERAL'])
 
-def mergeXmlAndMetadata(initialXmlRoot, metadataDict):
-    structuredAnnotations = ET.Element('StructuredAnnotations')
+    inputFormat = sys.argv[1].rsplit(".", 1)[1]
+    xml = createOmeXml(im, initialXml, inputFormat)
+    im.set_type(pyvips.GValue.gstr_type, "image-description", xml)
+
+    im.tiffsave(sys.argv[2], compression="jpeg", tile=True,
+                tile_width=256, tile_height=256,
+                pyramid=True, subifd=True)
+
+def createOmeXml(im, initialXml, inputFormat):
+    mdDict = extractMetadata(im, inputFormat)
+    ET.register_namespace("OME", "http://www.openmicroscopy.org/Schemas/OME/2016-06")
+    root = ET.fromstring(initialXml)
+    structuredAnnotations = ET.SubElement(root, "OME:StructuredAnnotations")
     counter = 0
-    for key, val in metadataDict.items():
-        createAnnotation(structuredAnnotations, counter, key, val)
+    for key, value in mdDict.items():
+        xmlAnnotation = ET.SubElement(structuredAnnotations, "OME:XMLAnnotation")
+        xmlAnnotation.set("ID", "Annotation:" + str(counter))
         counter += 1
-    initialXmlRoot.append(structuredAnnotations)
-    return ET.tostring(initialXmlRoot, encoding='utf-8')
+        val = ET.SubElement(xmlAnnotation, "OME:Value")
+        originalMetadata = ET.SubElement(val, "OriginalMetadata")
+        k = ET.SubElement(originalMetadata, "Key")
+        k.text = key
+        v = ET.SubElement(originalMetadata, "Value")
+        v.text = value
+    return ET.tostring(root, encoding='utf-8')
 
-def createAnnotation(structuredAnnotations, counter, key, val):
-    xmlAnnotation = ET.SubElement(structuredAnnotations, 'XMLAnnotation',
-                                    ID='Annotation:' + str(counter),
-                                    Namespace='openmicroscopy.org/OriginalMetadata')
-    value = ET.SubElement(xmlAnnotation, 'Value')
-    originalMetadata = ET.SubElement(value, 'OriginalMetadata')
-    k = ET.SubElement(originalMetadata, 'Key')
-    k.text = key
-    v = ET.SubElement(originalMetadata, 'Value')
-    v.text = val
+def extractMetadata(im, inputFormat):
+    mdDict = {}
+    items = []
+    if inputFormat == "mrxs":
+        items = filter(lambda item: "mirax.GENERAL" in item, im.get_fields())
+    elif inputFormat == "svs":
+        items = filter(lambda item: "aperio." in item, im.get_fields())
+    for item in items:
+        key = item.rsplit(".", 1)[1]
+        value = im.get(item)
+        mdDict[key] = value
+    return mdDict
 
 if __name__ == "__main__":
     main()
-
-
